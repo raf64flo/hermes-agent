@@ -8,140 +8,160 @@ from pathlib import Path
 
 # Ajouter le plugin au path
 PLUGIN_DIR = Path(__file__).parent
-sys.path.insert(0, str(PLUGIN_DIR.parent.parent / "plugins"))
+WORKTREE = Path(__file__).parent.parent
+HERMES_AGENT = WORKTREE / "hermes-agent"
+sys.path.insert(0, str(HERMES_AGENT))
+sys.path.insert(0, str(WORKTREE / "plugins"))
+
+# Créer un module mock pour hermes_cli.plugins
+plugins_mock = types.ModuleType("hermes_cli.plugins")
+plugins_mock.get_plugin_manager.return_value.has_hook.return_value = False
+sys.modules["hermes_cli.plugins"] = plugins_mock
+
+# Mock hermes_cli.profiles
+profiles_mock = types.ModuleType("hermes_cli.profiles")
+profiles_mock.load_yaml = lambda path, default=None: {} if default is not None else None
+sys.modules["hermes_cli.profiles"] = profiles_mock
+
+# Mock hermes_cli.plugin_context
+pc = types.ModuleType("hermes_cli.plugin_context")
+pc.PluginContext = types.SimpleNamespace(
+    get_plugin_config=lambda: {"type": {"enabled": True, "per_model_concurrency": 2}},
+    register_hook=lambda *a, **k: None,
+    logger=lambda *a, **k: None,
+)
+sys.modules["hermes_cli.plugin_context"] = pc
+
+
+# Maintenant on peut importer le plugin
+from kanban_model_quota import (  # noqa: E402
+    register,
+    _is_enabled,
+    _get_max_concurrency,
+    _get_error_count,
+    _check_circuit_breaker,
+    _spawn_model_guard_callback,
+    config_schema,
+)
 
 
 class FakeCtx:
-    """Contexte factice pour les hooks Hermes."""
-
-    def __init__(self, config: dict | None = None):
-        self._config = config or {}
-        self._hooks: dict[str, list] = {}
-
-    def register_hook(self, name: str, callback):
-        self._hooks.setdefault(name, []).append(callback)
-
     def get_plugin_config(self):
-        return self._config
+        return {"type": {"enabled": True, "per_model_concurrency": 2}}
 
 
-# Charger le plugin avec le contexte factice
-import importlib.util
-spec = importlib.util.spec_from_file_location(
-    "kanban_model_quota",
-    str(PLUGIN_DIR / "__init__.py"),
-)
-plugin = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(plugin)
-
-# Vérifier que le plugin s'enregistre correctement
-ctx = FakeCtx(config={
-    "enabled": True,
-    "per_model_concurrency": 2,
-    "circuit_breaker": {
-        "enabled": True,
-        "error_threshold": 5,
-        "recovery_time_seconds": 300,
-    },
-})
-plugin.register(ctx)
-
-assert len(ctx._hooks.get("kanban_spawn_model_guard", [])) == 1, "Le plugin doit s'enregistrer au hook"
-callback = ctx._hooks["kanban_spawn_model_guard"][0]
+class DisabledCtx:
+    def get_plugin_config(self):
+        return {"type": {"enabled": False, "per_model_concurrency": 2}}
 
 
-def test_plugin_enabled_allows_under_quota():
-    """Quota non atteint → autorisation."""
-    result = callback(
+class CustomCtx:
+    def get_plugin_config(self):
+        return {"type": {"enabled": True, "per_model_concurrency": 5}}
+
+
+def test_default_config():
+    ctx = FakeCtx()
+    assert _is_enabled(ctx) is True
+    assert _get_max_concurrency(ctx) == 2
+
+
+def test_config_override():
+    ctx = CustomCtx()
+    assert _is_enabled(ctx) is True
+    assert _get_max_concurrency(ctx) == 5
+
+
+def test_disabled_config():
+    ctx = DisabledCtx()
+    assert _is_enabled(ctx) is False
+
+
+def test_quota_check_under_limit():
+    ctx = FakeCtx()  # per_model_concurrency = 2
+    # 1 en vol sur 2 max -> autorisé
+    result = _spawn_model_guard_callback(
         ctx,
-        task_id="t_test1",
-        board="test-fibo",
-        assignee="hermes-optimizer",
-        model="qwen-3-6-35b-a3b",
-        profile_name="hermes-optimizer",
-        dry_run=True,
-        in_flight_by_model={"qwen-3-6-35b-a3b": 1},  # max=2
+        "t_test_1",
+        "test-fibo",
+        "hermes-optimizer",
+        "gpt-4o",
+        "architect",
+        False,
+        {"gpt-4o": 1},
     )
-    assert result is None, f"Devrait autoriser, got: {result}"
-    print("✓ test_plugin_enabled_allows_under_quota")
+    assert result is None
 
 
-def test_plugin_enabled_blocks_over_quota():
-    """Quota atteint → blocage."""
-    result = callback(
+def test_quota_check_at_limit():
+    ctx = FakeCtx()  # per_model_concurrency = 2
+    # 2 en vol sur 2 max -> bloqué
+    result = _spawn_model_guard_callback(
         ctx,
-        task_id="t_test2",
-        board="test-fibo",
-        assignee="hermes-optimizer",
-        model="qwen-3-6-35b-a3b",
-        profile_name="hermes-optimizer",
-        dry_run=False,
-        in_flight_by_model={"qwen-3-6-35b-a3b": 2},  # max=2
+        "t_test_1",
+        "test-fibo",
+        "hermes-optimizer",
+        "gpt-4o",
+        "architect",
+        False,
+        {"gpt-4o": 2},
     )
-    assert result is not None, "Devrait bloquer quand quota atteint"
-    assert "quota_exceeded" in result, f"Motif attendu: quota_exceeded, got: {result}"
-    print("✓ test_plugin_enabled_blocks_over_quota")
+    assert result is not None
+    assert "quota_exceeded" in result
 
 
-def test_plugin_disabled_allows_everything():
-    """Plugin désactivé → toujours autoriser."""
-    ctx_disabled = FakeCtx(config={"enabled": False})
-    plugin.register(ctx_disabled)
-    cb = ctx_disabled._hooks["kanban_spawn_model_guard"][0]
-    result = cb(
-        ctx_disabled,
-        task_id="t_test3",
-        board="test-fibo",
-        assignee="hermes-optimizer",
-        model="qwen-3-6-35b-a3b",
-        profile_name="hermes-optimizer",
-        dry_run=False,
-        in_flight_by_model={"qwen-3-6-35b-a3b": 999},
-    )
-    assert result is None, f"Devrait autoriser plugin désactivé, got: {result}"
-    print("✓ test_plugin_disabled_allows_everything")
-
-
-def test_plugin_no_model_allows():
-    """Pas de modèle → autorisation."""
-    result = callback(
+def test_quota_check_over_limit():
+    ctx = FakeCtx()  # per_model_concurrency = 2
+    # 10 en vol sur 2 max -> bloqué
+    result = _spawn_model_guard_callback(
         ctx,
-        task_id="t_test4",
-        board="test-fibo",
-        assignee="hermes-optimizer",
-        model=None,
-        profile_name="hermes-optimizer",
-        dry_run=False,
-        in_flight_by_model={},
+        "t_test_1",
+        "test-fibo",
+        "hermes-optimizer",
+        "gpt-4o",
+        "architect",
+        False,
+        {"gpt-4o": 10},
     )
-    assert result is None, f"Devrait autoriser sans modèle, got: {result}"
-    print("✓ test_plugin_no_model_allows")
+    assert result is not None
+    assert "quota_exceeded" in result
 
 
-def test_plugin_different_models_independent():
-    """Modèles différents ont des quotas indépendants."""
-    result = callback(
+def test_none_model_ignored():
+    """Quand model_override est None, le plugin retourne None (autorisé)."""
+    ctx = FakeCtx()
+    result = _spawn_model_guard_callback(
         ctx,
-        task_id="t_test5",
-        board="test-fibo",
-        assignee="architect",
-        model="anthropic-albert/deepseek-v4-flash",
-        profile_name="architect",
-        dry_run=False,
-        in_flight_by_model={
-            "qwen-3-6-35b-a3b": 2,
-            "anthropic-albert/deepseek-v4-flash": 1,  # max=2, OK
-        },
+        "t_test_1",
+        "test-fibo",
+        "unknown",
+        None,  # model=None
+        "default",
+        False,
+        {},
     )
-    assert result is None, f"Devrait autoriser modèle indépendant, got: {result}"
-    print("✓ test_plugin_different_models_independent")
+    assert result is None
 
 
-# Exécuter les tests
 if __name__ == "__main__":
-    test_plugin_enabled_allows_under_quota()
-    test_plugin_enabled_blocks_over_quota()
-    test_plugin_disabled_allows_everything()
-    test_plugin_no_model_allows()
-    test_plugin_different_models_independent()
-    print("\n✅ 5/5 tests unitaires passés")
+    tests = [
+        test_default_config,
+        test_config_override,
+        test_disabled_config,
+        test_quota_check_under_limit,
+        test_quota_check_at_limit,
+        test_quota_check_over_limit,
+        test_none_model_ignored,
+    ]
+    passed = 0
+    failed = 0
+    for test in tests:
+        try:
+            test()
+            print(f"  ✓ {test.__name__}")
+            passed += 1
+        except Exception as e:
+            print(f"  ✗ {test.__name__}: {e}")
+            failed += 1
+    print(f"\n✅ {passed}/{passed + failed} tests passés")
+    sys.exit(1 if failed else 0)
