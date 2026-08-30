@@ -352,6 +352,35 @@ VALID_HOOKS: Set[str] = {
     #     skipped_nonspawnable, skipped_locked).
     #   Privacy: result carries task ids, assignees, and workspace paths.
     "on_kanban_dispatch_tick",
+    # Kanban spawn-guard hook (model-quota guard, A9). The FIRST synchronous
+    # (decision-returning) kanban hook — unlike every other kanban hook above
+    # it is NOT an observer: return values ARE honored. Fired per candidate
+    # task in dispatch_once, atomically BEFORE claim_task, at the same
+    # decision point as check_respawn_guard (the per-task respawn guard it
+    # extends). A callback returns a str reason to DEFER the spawn this
+    # tick — the task stays in `ready` (never stranded `running` without a
+    # PID, which is what refusing inside spawn_fn would cause). None/empty
+    # lets the spawn proceed.
+    #
+    # Purpose: per-model quota enforcement for the dispatcher. A plugin can
+    # cap concurrent in-flight worker spawns per model, break the circuit on
+    # a model whose recent runs all hit a provider quota wall, or apply any
+    # other dispatcher-side policy, keeping flow-control authority in a
+    # user-tuneable plugin instead of the core.
+    #
+    # Must run under the board's dispatch lock AND stay fast (same rule as
+    # check_respawn_guard). Callers short-circuit on plugins.has_hook(), so
+    # when no plugin subscribes the dispatch hot path pays one dict probe.
+    #
+    # Kwargs: task_id: str, board: str | None, assignee: str | None,
+    #   model: str | None (resolved from the assignee profile's primary
+    #   model, or the task's pinned model override — may be None when
+    #   unresolvable), profile_name: str, dry_run: bool,
+    #   in_flight_by_model: dict[str, int] (count of live spawned workers
+    #   currently in flight grouped by resolved model).
+    # Returns: str reason (block) | None/empty (allow). First non-empty
+    # reason wins; a misbehaving callback (raising) is isolated by invoke_hook.
+    "kanban_spawn_model_guard",
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each
     # callback isolated by invoke_hook. Payloads are normalized envelopes only,
     # never raw platform SDK objects (per #64176 / #64182 ground rule). This

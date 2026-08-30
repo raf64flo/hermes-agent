@@ -9622,6 +9622,117 @@ def review_dispatch_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# A9: Model-quota guard (dispatch-time per-model concurrency cap)
+# ---------------------------------------------------------------------------
+
+def _resolve_task_model(assignee, model_override):
+    """Resolve the model a task will actually run on.
+
+    ``model_override`` (pinned on the board) wins; otherwise fall back to the
+    assignee profile's primary model (``config.yaml → model.default``).
+    Returns None when unresolvable (no override, unknown assignee, or a
+    profile read failure) — callers treat None as "no quota signal".
+
+    Best-effort and deliberately cheap: called per candidate task per tick,
+    so profile reads are guarded and failure is swallowed.
+    """
+    if model_override:
+        return model_override
+    if not assignee:
+        return None
+    try:
+        from hermes_cli.profiles import (
+            _read_config_model,
+            get_profile_dir,
+            normalize_profile_name,
+        )
+        profile_dir = get_profile_dir(normalize_profile_name(assignee))
+        model, _provider = _read_config_model(profile_dir)
+        return model or None
+    except Exception:
+        return None
+
+
+def _count_in_flight_by_model(conn, *, _model_cache=None):
+    """Count live spawned workers (``running`` with a persisted worker PID)
+    grouped by effective model.
+
+    A task's effective model is its ``model_override`` or its assignee
+    profile's primary model. Profile reads are memoised via ``_model_cache``
+    (shared across the dispatch tick) to avoid repeated file IO and are
+    best-effort: an unresolvable model groups under ``"?"``.
+
+    NOTE: this counts per model at one instant. It does not itself enforce
+    the quota — it feeds the ``kanban_spawn_model_guard`` hook so a plugin
+    can decide.
+    """
+    cache = {} if _model_cache is None else _model_cache
+    rows = conn.execute(
+        "SELECT assignee, model_override FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    by_model = {}
+    for r in rows:
+        key = (r["assignee"], r["model_override"])
+        if key not in cache:
+            cache[key] = _resolve_task_model(r["assignee"], r["model_override"])
+        model = cache[key] or "?"
+        by_model[model] = by_model.get(model, 0) + 1
+    return by_model
+
+
+def _check_spawn_model_quota(
+    conn, task_id, assignee, model_override, *, board=None, dry_run=False,
+    _model_cache=None,
+):
+    """Fire the ``kanban_spawn_model_guard`` hook and return the block reason.
+
+    Short-circuits to ``None`` (allow) when no plugin subscribes.
+    Best-effort: any hook invocation failure is swallowed and treated as
+    "allow" so a misbehaving guard can never wedge the dispatcher.
+    """
+    if not _kanban_observer_consumed("kanban_spawn_model_guard"):
+        return None
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+        except Exception:
+            get_active_profile_name = None
+
+        if get_active_profile_name:
+            try:
+                profile_name = get_active_profile_name()
+            except Exception:
+                profile_name = "default"
+        else:
+            profile_name = "default"
+
+        model = _resolve_task_model(assignee, model_override)
+        in_flight = _count_in_flight_by_model(conn, _model_cache=_model_cache)
+
+        reasons = invoke_hook(
+            "kanban_spawn_model_guard",
+            task_id=task_id,
+            board=board,
+            assignee=assignee,
+            model=model,
+            profile_name=profile_name,
+            dry_run=dry_run,
+            in_flight_by_model=in_flight,
+        )
+        for r in reasons:
+            if r:
+                return str(r)
+    except Exception as exc:
+        import logging
+        logging.getLogger("hermes_cli.kanban").debug(
+            "kanban_spawn_model_guard failed: %s", exc
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
 # Two production incidents ("larrikin-lollies", "synclare-task-manager")
@@ -10045,7 +10156,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, model_override FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10054,7 +10165,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, model_override FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10106,6 +10217,11 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+
+    # Model-quota guard cache (A9). Shared across the tick so profile reads
+    # are done once per (assignee, model_override) pair instead of per-candidate.
+    _spawn_model_cache: dict = {}
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10219,6 +10335,23 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "respawn_guarded",
+                        {"reason": guard_reason},
+                    )
+            continue
+        # Model-quota guard (A9): check per-model concurrency cap before
+        # spawning. Short-circuits when no plugin subscribed (cheap).
+        guard_reason = _check_spawn_model_quota(
+            conn, row["id"], row_assignee,
+            row["model_override"] if "model_override" in row.keys() else None,
+            board=board, dry_run=dry_run,
+            _model_cache=_spawn_model_cache,
+        )
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
@@ -10348,6 +10481,23 @@ def _dispatch_once_locked(
                 )
                 continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "respawn_guarded",
+                        {"reason": guard_reason},
+                    )
+            continue
+        # Model-quota guard (A9): check per-model concurrency cap before
+        # spawning. Short-circuits when no plugin subscribed (cheap).
+        guard_reason = _check_spawn_model_quota(
+            conn, row["id"], row["assignee"],
+            row["model_override"] if "model_override" in row.keys() else None,
+            board=board, dry_run=dry_run,
+            _model_cache=_spawn_model_cache,
+        )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
