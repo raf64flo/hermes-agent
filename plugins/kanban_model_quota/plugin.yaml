@@ -1,0 +1,32 @@
+name: kanban_model_quota
+version: "1.0.0"
+description: Plugin de contrôle par quota de modèles pour le dispatch kanban
+author: hermes-optimizer
+hooks:
+  - name: kanban_spawn_model_guard
+    returns: Optional[str] — motif de blocage ou None pour autoriser
+config_schema:
+  type: object
+  properties:
+    enabled:
+      type: boolean
+      default: true
+      description: Activer/désactiver le plugin
+    per_model_concurrency:
+      type: integer
+      default: 1
+      description: Nombre maximum de workers par modèle
+    circuit_breaker:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        error_threshold:
+          type: integer
+          default: 5
+          description: Nombre d'erreurs avant activation du circuit breaker
+        recovery_time:
+          type: integer
+          default: 300
+          description: Temps de récupération en secondes
