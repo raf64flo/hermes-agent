@@ -3119,32 +3119,50 @@ def _deliver_crash_failure(
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None
+    # The crash-failure lane can run BEFORE _run_one_job_body installs the profile scope:
+    # run_one_job's dispatch-failure handler calls us straight out of the except at :2745,
+    # so there is NO profile scope bound in a multiplex gateway. Resolving a matrix or any
+    # other <platform>_HOME_* delivery target via get_secret then raises
+    # UnscopedSecretError, which MASKS the underlying dispatch error ("Hermes could not read
+    # this profile's MATRIX_HOME_ROOM ..."). Bind the same secret + terminal scope the normal
+    # run path binds (see _run_one_job_body) so the failure notice can actually leave.
+    from agent.secret_scope import (
+        build_profile_secret_scope, reset_secret_scope, set_secret_scope)
+    from tools.terminal_scope import (
+        install_profile_terminal_scope, reset_terminal_scope)
+    _scope_token = set_secret_scope(
+        build_profile_secret_scope(_get_hermes_home()), profile_home=str(_get_hermes_home()))
+    _terminal_scope_token = install_profile_terminal_scope(_get_hermes_home())
     try:
-        delivery_error = _deliver_result(
-            job,
-            # Same text as the normal failure delivery: this run also counts toward
-            # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
-            adapters=adapters,
-            loop=loop,
-            for_failure=True,
+        try:
+            delivery_error = _deliver_result(
+                job,
+                # Same text as the normal failure delivery: this run also counts toward
+                # failure_streak, so the nudge must leave through here too.
+                _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+                adapters=adapters,
+                loop=loop,
+                for_failure=True,
+            )
+        except Exception as delivery_exc:
+            delivery_error = str(delivery_exc)
+            logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
+        unresolved_origin = bool(
+            not delivery_error
+            and normalized_deliver == "origin"
+            and not _resolve_delivery_targets(job, for_failure=True)
         )
-    except Exception as delivery_exc:
-        delivery_error = str(delivery_exc)
-        logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
-    unresolved_origin = bool(
-        not delivery_error
-        and normalized_deliver == "origin"
-        and not _resolve_delivery_targets(job, for_failure=True)
-    )
-    delivery_outcome = _classify_delivery_outcome(
-        delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
-        normalized_deliver=normalized_deliver, incident_acked=False, success=False,
-        delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
-    if delivery_outcome in ("delivered", "not_configured"):
-        _mark_incident_alerted(failure_incident_id)
-    return delivery_error, delivery_outcome
+        delivery_outcome = _classify_delivery_outcome(
+            delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
+            normalized_deliver=normalized_deliver, incident_acked=False, success=False,
+            delivery_queued=job.get("last_delivery_queued"),
+            notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
+        if delivery_outcome in ("delivered", "not_configured"):
+            _mark_incident_alerted(failure_incident_id)
+        return delivery_error, delivery_outcome
+    finally:
+        reset_secret_scope(_scope_token)
+        reset_terminal_scope(_terminal_scope_token)
 
 
 

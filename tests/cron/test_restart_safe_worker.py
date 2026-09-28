@@ -634,11 +634,13 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
         lambda **_: {"PATH": os.environ.get("PATH", ""),
                      "PYTHONPATH": str(tmp_path / "kept-by-sanitizer")},
     )
-    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+    spawn_calls_made, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
     repo_root = Path(scheduler.__file__).resolve().parent.parent
 
+    # Deterministic: pin must not depend on the machine's committed PM generation.
+    monkeypatch.setattr(worker_env_mod, "_runtime_site_packages", lambda _root: None)
     assert scheduler._launch_external_cron_worker(job) is True
-    entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
+    entries = spawn_calls_made[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
     assert entries == [str(repo_root), str(tmp_path / "kept-by-sanitizer")]
 
     # Wheel / pipx layout: repo_root == purelib -> untouched.
@@ -646,6 +648,57 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     untouched = {"PYTHONPATH": str(tmp_path / "kept-by-sanitizer")}
     assert worker_env_mod.pin_hermes_tree_on_pythonpath(dict(untouched), repo_root) == untouched
     assert "PYTHONPATH" not in worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root)
+
+
+def test_pin_appends_runtime_site_packages_after_repo_root(tmp_path, monkeypatch):
+    """The worker may run on a bare tool Python (multiplexed gateway) whose own
+    site-packages lack the checked-in deps (e.g. ruamel.yaml, pinned for py>=3.14);
+    those live only in the PM generation PM committed for the repo. The pin keeps
+    repo_root first (so `cron` resolves to this checkout) and appends the generation
+    site-packages so the runtime deps are importable."""
+    import cron.scheduler_worker_env as worker_env_mod
+
+    repo_root = tmp_path / "repo"
+    gen_sp = tmp_path / "generations" / "g1" / "lib" / "python3.14" / "site-packages"
+    monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: None)
+    monkeypatch.setattr(worker_env_mod, "_runtime_site_packages", lambda _root: gen_sp)
+
+    env = pin_env = worker_env_mod.pin_hermes_tree_on_pythonpath(
+        {"PYTHONPATH": str(tmp_path / "user-libs")}, repo_root)
+    assert pin_env["PYTHONPATH"].split(os.pathsep) == [
+        str(repo_root), str(gen_sp), str(tmp_path / "user-libs")]
+
+
+def test_pin_skips_runtime_site_packages_when_none_or_worker_is_generation(monkeypatch, tmp_path):
+    """No committed generation -> only repo_root is pinned. When the runtime
+    site-packages equals the interpreter's own purelib (the worker already IS the
+    generation interpreter), appending it would hoist site-packages above the stdlib,
+    so it must be skipped."""
+    import cron.scheduler_worker_env as worker_env_mod
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    # No committed PM environment -> _runtime_site_packages returns None.
+    monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: None)
+    monkeypatch.setattr(worker_env_mod, "_runtime_site_packages", lambda _root: None)
+    env = worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root)
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(repo_root)]
+
+def test_runtime_site_packages_skipped_when_worker_is_generation(monkeypatch, tmp_path):
+    """``_runtime_site_packages`` returns None when the PM generation's site-packages
+    equals the interpreter's own purelib (the worker already IS the generation
+    interpreter); pinning it would hoist site-packages above the stdlib."""
+    import cron.scheduler_worker_env as worker_env_mod
+    import pm.environments as pm_env
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    gen_sp = tmp_path / "gen" / "site-packages"
+
+    monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: gen_sp)
+    monkeypatch.setattr(pm_env, "selected_venv", lambda _root: tmp_path / "venv")
+    monkeypatch.setattr(pm_env, "site_packages", lambda _v: gen_sp)
+    assert worker_env_mod._runtime_site_packages(repo_root) is None
 
 
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
@@ -708,6 +761,57 @@ def test_dispatch_failure_opens_incident_and_delivers_failure_notice(
     assert len(delivered) == 1
     assert execution_ledger.get_execution(repeat["id"])["delivery_outcome"] == \
         "suppressed_acked"
+
+
+def test_deliver_crash_failure_binds_profile_scope_for_home_target(monkeypatch, tmp_path):
+    """Regression (#02a14c54): the crash-failure lane can run BEFORE _run_one_job_body
+    installs the profile scope (run_one_job's dispatch-failure handler calls us straight
+    out of the except). Under a multiplex gateway, resolving a matrix / other
+    <platform>_HOME_* target via get_secret then raised UnscopedSecretError, which MASKED
+    the underlying dispatch error. _deliver_crash_failure must bind the profile secret +
+    terminal scope for its ENTIRE delivery lane, not just the send."""
+    import cron.scheduler as scheduler
+    import agent.secret_scope as ss
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / ".env").write_text("MATRIX_HOME_ROOM=!room:example.org\n")
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
+    seen = {}
+
+    def _fake_deliver_result(job, content, **_kw):
+        # Mimic the multiplex gateway: without a bound profile scope get_secret raises.
+        from agent.secret_scope import get_secret
+        try:
+            seen["room"] = get_secret("MATRIX_HOME_ROOM", "SENTINEL")
+            seen["scope_present"] = True
+        except Exception as e:  # noqa: BLE001
+            seen["scope_present"] = False
+            seen["exc"] = str(e)
+        return "boom"
+
+    monkeypatch.setattr(scheduler, "_deliver_result", _fake_deliver_result)
+    monkeypatch.setattr(scheduler, "_upsert_incident_for_failure",
+                        lambda *_a, **_k: (False, "inc"))
+    monkeypatch.setattr(ss, "_MULTIPLEX_ACTIVE", True)
+
+    result = scheduler._deliver_crash_failure(
+        {"id": "j", "deliver": "local"}, "boom", adapters=None, loop=None)
+
+    # The scope was bound: the matrix home-room credential resolved without raising.
+    assert seen.get("scope_present") is True
+    assert seen.get("room") == "!room:example.org"
+    # Failure delivery returned its error/outcome tuple, scopes reset afterwards.
+    assert result[0] == "boom"
+    # Scope reset in the finally: a subsequent get_secret must raise again.
+    try:
+        from agent.secret_scope import get_secret
+        get_secret("MATRIX_HOME_ROOM", "SENTINEL")
+        reset_ok = False
+    except Exception:  # noqa: BLE001
+        reset_ok = True
+    assert reset_ok
 
 
 def test_shutdown_does_not_interrupt_restart_safe_waiter():
