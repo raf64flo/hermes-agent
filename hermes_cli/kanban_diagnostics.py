@@ -359,6 +359,35 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_cross_board_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Cross-board note: the completion summary references ``t_<hex>``
+    ids that don't exist on *this* board but DO resolve on another
+    board's database. These are legitimate inter-board references, NOT
+    hallucinated ids.
+
+    Kept as a distinct ``kind`` from ``prose_phantom_refs`` so the two
+    are never conflated: a phantom is an id that exists nowhere, a
+    cross-board ref is an id that exists somewhere else. Non-blocking;
+    surfaced as a low-severity warning purely so the reference is
+    visible/auditable.
+    """
+    hits = _active_hallucination_events(events, "cross_board_references")
+    if not hits:
+        return []
+    return [Diagnostic(
+        kind="cross_board_refs", severity="warning",
+        title="Completion summary references task ids on another board",
+        detail=("The completion summary mentions task ids that don't resolve on "
+               "this board but exist on another board's database. These are valid "
+               "inter-board references — not hallucinated ids. Shown for "
+               "visibility only; no action required if the cross-board reference "
+               "is intended."),
+        actions=_generic_recovery_actions(task, running=_is_running(task)),
+        first_seen_at=_event_ts(hits[0]), last_seen_at=_event_ts(hits[-1]), count=len(hits),
+        data={"cross_board_refs": _unique_payload_ids(hits, "cross_board_refs")},
+    )]
+
+
 def _failure_threshold(cfg: dict) -> Any:
     """``failure_threshold`` with the legacy ``spawn_failure_threshold`` alias."""
     return cfg.get("failure_threshold", cfg.get("spawn_failure_threshold", 3))
@@ -741,6 +770,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_cross_board_refs,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,

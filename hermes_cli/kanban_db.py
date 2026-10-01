@@ -2741,6 +2741,99 @@ def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str
     return _missing_task_ids(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text)))
 
 
+def _find_cross_board_refs(task_ids: Iterable[str]) -> set[str]:
+    """Return the subset of ``task_ids`` that exist on another board.
+
+    Scans every other board's ``kanban.db`` under ``boards_root()`` plus
+    the legacy ``default`` board DB (``<root>/kanban.db``) when that
+    board is not the one currently being written. Boards opened read-only
+    with ``sqlite3`` directly (no kanban CLI, no writes, no migration
+    pass), so a corrupt or unreadable sibling board can never break or
+    mutate a completion — such boards are silently skipped.
+
+    IDs resolved here are valid *cross-board* references, not phantoms:
+    the task exists, just lives on a different board's database.
+    """
+    if not task_ids:
+        return set()
+    wanted = list(dict.fromkeys(task_ids))  # dedupe, preserve order
+    placeholders = ",".join(["?"] * len(wanted))
+    found: set[str] = set()
+
+    current_slug = (get_current_board() or DEFAULT_BOARD).strip()
+    candidates: list[Path] = []
+
+    # The ``default`` board's DB is not under boards/ — treat it as a
+    # sibling board only when the current board is not ``default``.
+    if current_slug != DEFAULT_BOARD:
+        default_db = kanban_home() / "kanban.db"
+        if default_db.exists():
+            candidates.append(default_db)
+
+    root = boards_root()
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir() or child.name.startswith("_"):
+                continue
+            try:
+                normed = _normalize_board_slug(child.name) or ""
+            except ValueError:
+                normed = ""
+            if not normed or normed == current_slug:
+                continue
+            db = child / "kanban.db"
+            if db.exists():
+                candidates.append(db)
+
+    for db in candidates:
+        try:
+            # Read-only open: never creates, never writes, never migrates a
+            # sibling board's DB. mode=ro fails cleanly if the board is
+            # currently mid-write (SQLite paves over this with WAL shared
+            # reads, but the guard still protects against exotic states).
+            ro = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True)
+        except Exception:
+            continue
+        try:
+            cur = ro.execute(
+                f"SELECT id FROM tasks WHERE id IN ({placeholders})",
+                tuple(wanted),
+            )
+            for row in cur.fetchall():
+                found.add(row[0])
+        except Exception:
+            pass  # unreadable/corrupt sibling board → never phantom-flag
+        finally:
+            try:
+                ro.close()
+            except Exception:
+                pass
+    return found
+
+
+def _classify_prose_task_refs(conn: sqlite3.Connection, text: str) -> tuple[list[str], list[str]]:
+    """Scan free-form text for ``t_<hex>`` refs and classify the ones
+    that don't resolve on the current board.
+
+    Returns ``(phantom_refs, cross_board_refs)``:
+
+    * ``phantom_refs`` — refs that resolve on **no** board at all:
+      genuinely hallucinated ids.
+    * ``cross_board_refs`` — refs that DO resolve, but only on another
+      board's database: legitimate inter-board references.
+
+    Duplicates are deduped. Order of the current board check is preserved
+    for both buckets so downstream diagnostics render stably.
+    """
+    missing = _scan_prose_for_phantom_ids(conn, text)
+    if not missing:
+        return [], []
+    cross_board = _find_cross_board_refs(missing)
+    cross_ordered = [m for m in missing if m in cross_board]
+    phantom = [m for m in missing if m not in cross_board]
+    return phantom, cross_ordered
+
+
 class HallucinatedCardsError(ValueError):
     """``complete_task`` refused: ``created_cards`` has ids that don't exist or
     weren't created by this worker (``.phantom``). A ``ValueError`` so tool
@@ -2817,7 +2910,10 @@ def complete_task(
     ``metadata`` land on the closing run for :func:`build_worker_context`.
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+    prose is scanned for unresolvable ``t_<hex>`` refs (advisory, non-blocking).
+    A ref that resolves on a *sibling board* is NOT a hallucination: it is
+    reported under the distinct ``cross_board_references`` kind so a legitimate
+    inter-board reference is never mislabelled as a phantom.
     Completions from non-review statuses need evidence: a stripped ``result``
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
@@ -3029,11 +3125,32 @@ def _flag_phantom_prose_refs(
 ) -> None:
     """Advisory post-commit scan of summary+result for unresolvable ``t_<hex>``
     references; emits ``suspected_hallucinated_references`` in its own txn so
-    the completion is already durable. Never blocks."""
+    the completion is already durable. Never blocks. A ref that resolves on a
+    *sibling board* is NOT a hallucination: it is reported under the distinct
+    ``cross_board_references`` kind (advisory, non-blocking)."""
     scan_text = " ".join(filter(None, [summary, result]))
     if not scan_text:
         return
-    phantom_refs = [p for p in _scan_prose_for_phantom_ids(conn, scan_text) if p not in set(verified_cards)]
+    phantom_refs, cross_board_refs = _classify_prose_task_refs(conn, scan_text)
+    # Drop any refs already flagged as verified above (shouldn't happen —
+    # verified means they exist — but belt-and-suspenders).
+    verified_set = set(verified_cards)
+    phantom_refs = [p for p in phantom_refs if p not in verified_set]
+    cross_board_refs = [c for c in cross_board_refs if c not in verified_set]
+    if cross_board_refs:
+        # Legitimate inter-board references (the id resolves on another
+        # board's kanban.db) — advisory, never a hallucination. Reported
+        # distinctly from phantom refs so a human re-reading the summary
+        # is not misled into thinking a real lesson-id was invented.
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "cross_board_references",
+                {
+                    "cross_board_refs": cross_board_refs,
+                    "source": "completion_summary",
+                },
+                run_id=run_id,
+            )
     if phantom_refs:
         with write_txn(conn):
             _append_event(
