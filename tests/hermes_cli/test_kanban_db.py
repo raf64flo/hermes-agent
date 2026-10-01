@@ -2084,3 +2084,61 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_cross_board_ref_classified_not_phantom(kanban_home):
+    """A ``t_<hex>`` id that exists on ANOTHER board's kanban.db is a
+    legitimate cross-board reference — it must NOT be flagged as a
+    hallucinated/phantom id, and must surface under a distinct event.
+    """
+    with kbc.connect(board="mattermost-rgpd") as xconn:
+        cross_tid = kb.create_task(xconn, title="cross board task", assignee="alice")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="local parent", assignee="alice")
+        # Reference the task living on the mattermost-rgpd board only.
+        kb.complete_task(
+            conn, tid,
+            summary=f"ported lesson from {cross_tid}",
+            result="done",
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "cross_board_references" in kinds
+        assert "suspected_hallucinated_references" not in kinds
+        ev = next(e for e in events if e.kind == "cross_board_references")
+        assert cross_tid in (ev.payload or {}).get("cross_board_refs", [])
+
+
+def test_cross_board_ref_still_phantom_when_nowhere(kanban_home):
+    """An id that exists on NO board (neither current nor any sibling)
+    must still be flagged as a genuine phantom reference and NOT leak
+    into the cross-board bucket.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="local parent", assignee="alice")
+        kb.complete_task(
+            conn, tid,
+            summary="referencing t_deadbeef1 nowhere",
+            result="done",
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "suspected_hallucinated_references" in kinds
+        assert "cross_board_references" not in kinds
+        ev = next(e for e in events if e.kind == "suspected_hallucinated_references")
+        assert "t_deadbeef1" in (ev.payload or {}).get("phantom_refs", [])
+
+
+def test_cross_board_ref_unit_classifier(kanban_home):
+    """The classifier splits a mixed bag correctly and dedupes."""
+    with kbc.connect(board="mattermost-rgpd") as xconn:
+        cross_tid = kb.create_task(xconn, title="x", assignee="alice")
+    with kbc.connect() as conn:
+        phantom, cross = kb._classify_prose_task_refs(
+            conn,
+            f"refs {cross_tid} and {cross_tid} dup plus t_badbadbad1 and nope",
+        )
+        assert cross == [cross_tid]
+        assert "t_badbadbad1" in phantom
+        assert cross_tid not in phantom

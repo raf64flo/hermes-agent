@@ -124,6 +124,30 @@ def test_stuck_in_blocked_fires_past_threshold():
 
 
 
+def test_cross_board_refs_rule_fires_distinct_kind():
+    """A ``cross_board_references`` event surfaces as the ``cross_board_refs``
+    diagnostic kind — NOT ``prose_phantom_refs`` — so a legitimate inter-board
+    reference is never mislabelled as a hallucination (AC: no false positive).
+    """
+    task = _task(id="t_demo00", status="ready")
+    events = [
+        _event("cross_board_references", cross_board_refs=["t_abc1", "t_abc2"]),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [])
+    cross = [d for d in diags if d.kind == "cross_board_refs"]
+    phantom = [d for d in diags if d.kind == "prose_phantom_refs"]
+    assert len(cross) == 1
+    assert cross[0].data["cross_board_refs"] == ["t_abc1", "t_abc2"]
+    assert phantom == []
+
+
+def test_cross_board_refs_rule_silent_without_event():
+    """No ``cross_board_references`` event → no cross-board diagnostic."""
+    task = _task(id="t_demo00", status="ready")
+    diags = kd.compute_task_diagnostics(task, [_event("created")], [])
+    assert [d for d in diags if d.kind == "cross_board_refs"] == []
+
+
 # ---------------------------------------------------------------------------
 # Integration — runs through real kanban_db so sqlite.Row fields work
 # ---------------------------------------------------------------------------
