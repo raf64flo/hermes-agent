@@ -325,6 +325,56 @@ staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
 
+## Task pattern grouping (opt-in)
+
+When the same procedure lands in `MEMORY.md` in slightly different wordings —
+a corrected retry, a background-review rephrasing — the budget fills up with
+near-duplicates. Task pattern grouping detects that and records it, so the
+duplicates can be consolidated instead of accumulating.
+
+**Off by default.** Enable it in `~/.hermes/config.yaml`:
+
+```yaml
+memory:
+  task_patterns:
+    enabled: true          # off by default
+    capture: true          # LLM 1: label the entry (≤ 6-word task_pattern)
+    judge: true            # LLM 2: merge/supersede/reject for paraphrases
+    max_judge_candidates: 12
+    timeout_seconds: 20
+    max_tokens: 220
+```
+
+How it works:
+
+1. After a memory entry is added or changed, a bounded background worker (max
+   2 concurrent, daemon, never blocks the write) labels the entry with a
+   `task_pattern` of at most six words. Plain facts, preferences and
+   environment notes are not procedures and are left unlabeled.
+2. Entries whose labels normalize to the same key are grouped
+   **deterministically** — no embedding calls, no vector store, no extra LLM.
+3. Paraphrases that miss the exact key are shown to a second LLM call that must
+   classify the new entry as `merge` / `supersede` / `reject` against the
+   existing entries **and cite the matched entry verbatim**. A citation that
+   does not match any candidate verbatim coerces the verdict to `reject`, so a
+   false positive can never fold an entry.
+4. Grouping writes `FOLDED_INTO` records (with the judge's citation) and a
+   decision audit trail to the sidecar ledger `memories/.memory_patterns.json`.
+   `MEMORY.md` / `USER.md` are never rewritten by this feature — the ledger is
+   a machine-readable interface for downstream consolidation.
+
+Both LLM calls run on the `auxiliary.memory_patterns` config slot, so you route
+them like any other auxiliary task (e.g. pin the slot to your local model);
+the auxiliary default applies when the slot is unset. No memory content leaves
+the auxiliary runtime.
+
+Guardrails:
+
+- An entry flagged by the strict `threat_patterns` scan — the same scan applied
+  at write time — is never grouped, and a flagged entry can never be folded into.
+- Capture is advisory: the worker writes only the sidecar ledger. Rollback is
+  `memory.task_patterns.enabled: false`; the ledger simply stops growing.
+
 ## Background review notifications (`display.memory_notifications`)
 
 After a turn, the background self-improvement review may quietly save a memory
