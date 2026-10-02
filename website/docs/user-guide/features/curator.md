@@ -46,6 +46,12 @@ By default the curator only **prunes** — the deterministic inactivity pass mar
 
 Pinned skills are off-limits to both the curator's auto-transitions and the agent's own `skill_manage` tool. See [Pinning a skill](#pinning-a-skill) below.
 
+### Memory → skill uplift
+
+When the [task-pattern ledger](./memory.md) groups two or more memory entries into one reusable procedure, the consolidation fork is also shown those groups and may **promote** each one into a skill in the live tree (a `skill_manage` create or patch — never the versioned house-skills directory). After the fork, the curator deterministically **demotes** the source fragments out of the bounded memory budget — but only for a group whose skill it can verify actually exists after the fork (a new skill created this run, or a pre-existing one the fork explicitly declared as the promotion target in its summary). A group whose skill was not materialized keeps its memory entries — the fold never loses information, and the E1 provenance backlink (`FOLDED_INTO`) is written *before* any removal, so even a partial fold stays recoverable.
+
+The uplift only runs with the consolidation pass on (`curator.consolidate: true` or `hermes curator run --consolidate`) and only for groups that exist in the ledger — no new LLM cost on its own, and nothing is touched on a default prune-only run. Before the first demotion of a run, `~/.hermes/memories/MEMORY.md` and `USER.md` are snapshotted to `~/.hermes/skills/.curator_backups/.memory_snapshots/<utc-iso>/` (kept 5, restored manually by copying the file back) — the run's `REPORT.md` names the snapshot so a fold can be undone.
+
 ## Configuration
 
 All settings live in `config.yaml` under `curator:` (not `.env` — this isn't a secret). Defaults:

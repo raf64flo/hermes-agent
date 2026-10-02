@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from collections import Counter
@@ -541,9 +542,10 @@ def _classify_removed_skills(
 
 
 def _parse_structured_summary(llm_final: str) -> Dict[str, List[Dict[str, str]]]:
-    """Extract the required fenced ```yaml block (``consolidations:`` / ``prunings:`` lists) from the curator's final
-    response. Tolerant: missing block or malformed YAML → empty lists (caller falls back to the tool-call heuristic); a partial
-    block returns what parsed. Returns ``{"consolidations": [{from, into, reason}], "prunings": [{name, reason}]}``."""
+    """Extract the required fenced ```yaml block (``consolidations:`` / ``prunings:`` / ``uplifts:`` lists) from the
+    curator's final response. Tolerant: missing block or malformed YAML → empty lists (caller falls back to the
+    tool-call heuristic); a partial block returns what parsed. Returns
+    ``{"consolidations": [{from, into, reason}], "prunings": [{name, reason}], "uplifts": [{slug, key, reason}]}``."""
     # Match ```yaml specifically so a code sample the model quoted elsewhere is never mistaken for the summary.
     match = re.search(r"```ya?ml\s*\n(.*?)\n```", llm_final, re.DOTALL | re.IGNORECASE) if isinstance(llm_final, str) else None
     data = None
@@ -554,7 +556,7 @@ def _parse_structured_summary(llm_final: str) -> Dict[str, List[Dict[str, str]]]
         except Exception:
             pass
     if not isinstance(data, dict):
-        return {"consolidations": [], "prunings": []}
+        return {"consolidations": [], "prunings": [], "uplifts": []}
 
     def _entries(key: str, *fields: str) -> List[Dict[str, str]]:
         raw = data.get(key) or []
@@ -562,7 +564,9 @@ def _parse_structured_summary(llm_final: str) -> Dict[str, List[Dict[str, str]]]
         cleaned = ({f: (v.strip() if isinstance((v := e.get(f)), str) else "") for f in (*fields, "reason")} for e in entries)
         return [e for e in cleaned if all(e[f] for f in fields)]
 
-    return {"consolidations": _entries("consolidations", "from", "into"), "prunings": _entries("prunings", "name")}
+    return {"consolidations": _entries("consolidations", "from", "into"),
+            "prunings": _entries("prunings", "name"),
+            "uplifts": _entries("uplifts", "slug")}
 
 
 def _extract_absorbed_into_declarations(tool_calls: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -698,6 +702,7 @@ def _write_file(path: Path, label: str, render: Any) -> None:
 def _write_run_report(
     *, started_at: datetime, elapsed_seconds: float, auto_counts: Dict[str, int], auto_summary: str,
     before_report: List[Dict[str, Any]], before_names: Set[str], after_report: List[Dict[str, Any]], llm_meta: Dict[str, Any],
+    uplifts: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Path]:
     """Write run.json + REPORT.md under logs/curator/{YYYYMMDD-HHMMSS}[-N]/ (N disambiguates a crash-rerun in the same
     second). Returns the report dir, or None if it couldn't be created (reporting is best-effort)."""
@@ -727,9 +732,12 @@ def _write_run_report(
             "archived_this_run": len(diff.removed), "added_this_run": len(diff.added),
             "consolidated_this_run": len(diff.consolidated), "pruned_this_run": len(diff.pruned),
             "state_transitions": len(transitions), "cron_jobs_rewritten": jobs_updated, "tool_calls_total": sum(tc_counts.values()),
+            "uplifts_demoted_this_run": sum(1 for u in (uplifts or []) if u.get("status") == "demoted"),
+            "memory_chars_reclaimed": sum(int(u.get("budget_dropped", 0) or 0) for u in (uplifts or [])),
         },
         "tool_call_counts": tc_counts, "archived": diff.removed, "consolidated": diff.consolidated, "pruned": diff.pruned,
-        "pruned_names": [p["name"] for p in diff.pruned], "added": diff.added, "state_transitions": transitions, "cron_rewrites": cron_rewrites,
+        "pruned_names": [p["name"] for p in diff.pruned], "added": diff.added, "state_transitions": transitions,
+        "cron_rewrites": cron_rewrites, "uplifts": uplifts or [],
         "llm_final": llm_meta.get("final", ""), "llm_summary": llm_meta.get("summary", ""),
         "llm_error": llm_meta.get("error"), "tool_calls": llm_meta.get("tool_calls", []),
     }
@@ -766,6 +774,20 @@ def _cron_rewrite_lines(entry: Dict[str, Any]) -> List[str]:
             + [f"    - `{name}` dropped (pruned)" for name in (entry.get("dropped") or [])])
 
 
+def _uplift_lines(entry: Dict[str, Any]) -> List[str]:
+    """One memory→skill uplift demotion: the fragments folded into the skill and the budget reclaimed."""
+    if entry.get("status") != "demoted":
+        return [f"- `{entry.get('slug', '?')}` — **kept in memory** ({entry.get('status', 'not validated')})"]
+    dropped = int(entry.get("budget_dropped", 0) or 0)
+    lines = [f"- `{entry.get('slug', '?')}`  (bucket `{entry.get('target', 'memory')}`, pattern `{entry.get('key', '?')}`) — "
+             f"{len(entry.get('removed') or [])} fragment(s) folded, **{dropped} chars** reclaimed from the budget"]
+    if entry.get("memory_snapshot"):
+        lines.append(f"    - memory files snapshotted before the fold (restore from `{entry['memory_snapshot']}`)")
+    for kept in (entry.get("kept") or []):
+        lines.append(f"    - kept in memory (fold not applied): {kept[:80]}")
+    return lines
+
+
 # REPORT.md list sections, in order: (payload key, heading, intro, per-entry renderer, cap, overflow hint).
 # Consolidated entries are archived (recoverable by design) but live on inside the umbrella.
 _REPORT_SECTIONS = (
@@ -783,6 +805,11 @@ _REPORT_SECTIONS = (
     ("cron_rewrites", "Cron job skill references rewritten",
      "_Cron jobs that referenced a consolidated or pruned skill were updated in-place so they keep loading the right instructions "
      "on their next run. See `cron_rewrites.json` for the full record._\n", _cron_rewrite_lines, 25, "see `cron_rewrites.json`"),
+    ("uplifts", "Memory → skill uplifts (folded out of the bounded memory budget)",
+     "_Memory fragments that re-injected the same reusable procedure were promoted to a live skill (via `skill_manage`) and the "
+     "source entries removed from `MEMORY.md`/`USER.md`, with a backlink in the provenance ledger. A `kept in memory` line means the "
+     "skill was not (or not only) materialised, so the fragment was left in place — nothing is ever removed without the skill existing._\n",
+     _uplift_lines, 50, "see `run.json`"),
 )
 
 
@@ -803,7 +830,9 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
         f"- tool calls: **{counts.get('tool_calls_total', 0)}** (by name: {', '.join(f'{k}={v}' for k, v in sorted(tc_counts.items())) or 'none'})",
         f"- consolidated into umbrellas: **{counts.get('consolidated_this_run', 0)}**",
         f"- pruned (archived for staleness): **{counts.get('pruned_this_run', 0)}**", f"- new skills this run: **{counts.get('added_this_run', 0)}**",
-        f"- state transitions (active ↔ stale ↔ archived): **{counts.get('state_transitions', 0)}**", "",
+        f"- state transitions (active ↔ stale ↔ archived): **{counts.get('state_transitions', 0)}**",
+        f"- memory→skill uplifts demoted: **{counts.get('uplifts_demoted_this_run', 0)}** "
+        f"({counts.get('memory_chars_reclaimed', 0)} chars reclaimed from the bounded budget)", "",
     ]
     for key, title, intro, render, show, hint in _REPORT_SECTIONS:
         items = p.get(key) or []
@@ -877,28 +906,187 @@ def _safe_curated_report() -> List[Dict[str, Any]]:
     return []
 
 
+def _uplift_candidates() -> tuple:
+    """Eligible E3 memory→skill uplift candidates + a read-only ``jev-curator`` consultation.
+
+    Fail-open by design (C3): the consultation is an input, never a blocking gate. On any
+    failure (no ledger, unreadable patterns, plugin unavailable) returns ``([], {"ok": False})``
+    so the pass degrades to today's behaviour.
+    """
+    try:
+        from tools import memory_uplift
+        candidates = memory_uplift.eligible_patterns()
+        if not candidates:
+            return [], {"ok": False, "summary": "no eligible memory patterns"}
+        return candidates, memory_uplift.consult_jev(candidates)
+    except Exception as e:
+        logger.debug("Curator uplift candidate collection failed: %s", e, exc_info=True)
+        return [], {"ok": False, "summary": f"uplift unavailable ({e})"}
+
+
+def _uplift_prompt_section(candidates: List[Dict[str, Any]], jev: Dict[str, Any]) -> str:
+    """Render the ``## Memory → skill uplift`` prompt block (empty string when no candidates)."""
+    if not candidates:
+        return ""
+    try:
+        from tools import memory_uplift
+        existing = {r.get("name") for r in skill_usage.curated_report() if isinstance(r, dict)}
+        return memory_uplift.render_uplift_section(candidates, existing_slugs=existing, jev=jev)
+    except Exception as e:
+        logger.debug("Curator uplift section render failed: %s", e, exc_info=True)
+        return ""
+
+
+def _memory_snapshot() -> Optional[Dict[str, Any]]:
+    """Best-effort pre-demotion snapshot of the memory files (AC2 — « ne supprime jamais
+    sans snapshot »). The curator's ``snapshot_skills`` covers only ``~/.hermes/skills/``;
+    the demotion pass additionally removes fragments from ``MEMORY.md`` / ``USER.md``, so
+    those files are copied to ``<backups>/.memory_snapshots/<utc-id>/`` with a timestamped
+    suffix per existing file. Restoration is manual (``cp`` back), the same trust model as
+    the skills snapshots. Never raises and never blocks the pass: a failed snapshot degrades
+    to today's behaviour (no memory backup, demotion still runs with the backlink-first
+    worst case). Returns ``{"path": ..., "files": [...]}`` or ``None`` when nothing was
+    backed up (memories dir missing, IO error)."""
+    from agent import curator_backup
+
+    try:
+        from tools import memory_tool
+        mem_dir = memory_tool.get_memory_dir()
+        if not mem_dir.is_dir():
+            return None
+        dest = curator_backup._backups_dir() / ".memory_snapshots" / curator_backup._utc_id()
+        dest.mkdir(parents=True, exist_ok=True)
+        copied: List[str] = []
+        for name in ("MEMORY.md", "USER.md"):
+            src = mem_dir / name
+            if src.is_file():
+                shutil.copy2(src, dest / f"{name}.{dest.name}")
+                copied.append(name)
+        if not copied:
+            shutil.rmtree(dest, ignore_errors=True)
+            return None
+        # Retention: keep the newest 5 memory snapshots (older ones age out; the skills
+        # snapshots keep their own ``curator.backup.keep`` policy).
+        snaps = sorted(curator_backup._backups_dir().joinpath(".memory_snapshots").iterdir())
+        for old in snaps[:-5]:
+            shutil.rmtree(old, ignore_errors=True)
+        return {"path": str(dest), "files": copied}
+    except Exception as e:
+        logger.debug("Memory pre-demotion snapshot failed: %s", e, exc_info=True)
+        return None
+
+
+def _declared_uplift_slugs(llm_meta: Dict[str, Any]) -> Set[str]:
+    """Slugs the fork explicitly declared it folded memory into (the ``uplifts:`` YAML block).
+
+    The ONLY declaration signal trusted for the *patch* case. A ``skill_manage`` create/patch
+    call merely named *X* is NOT enough: the fork may create/patch *X* for an unrelated
+    consolidation, and demoting fragments into a skill that does not actually contain the
+    procedure would lose information.
+    """
+    slugs = set()
+    for entry in _parse_structured_summary(llm_meta.get("final", "") or "").get("uplifts", []) or []:
+        s = str(entry.get("slug") or "").strip()
+        if s:
+            slugs.add(s)
+    return slugs
+
+
+def _demote_validated_uplifts(candidates: List[Dict[str, Any]], before_names: Set[str],
+                              llm_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Post-fork, deterministic demotion of validated uplift candidates.
+
+    A candidate is validated only if its slug exists in the live skill tree *after* the fork AND
+    (the fork declared it in ``uplifts:`` OR the skill was newly created this run). Anything
+    less → keep the memory (fail-safe). The pre-run snapshot protects this pass (AC2); the
+    backlink is written before any removal (E1), so the worst case is "fragment kept + backlink".
+    Never raises.
+    """
+    try:
+        from tools import memory_uplift
+        after_names = set(_by_name(_safe_curated_report()))
+        declared = _declared_uplift_slugs(llm_meta)
+        # AC2 — never demote without a snapshot: the skills snapshot (``snapshot_skills``)
+        # covers only the skill tree; the memory files hold the fragments being removed, so
+        # snapshot them too (best-effort, recorded in each demoted report for manual restore).
+        # Lazy: taken only when the first demotion is actually approved (no waste on a
+        # keep-all run); attached to every demoted entry in this run.
+        snap_path: Optional[str] = None
+        snap_taken = False
+        store = None
+        results: List[Dict[str, Any]] = []
+        for cand in candidates:
+            slug = str(cand.get("slug") or "").strip()
+            key = str(cand.get("key") or "")
+            target = cand.get("target", "memory")
+            entries = cand.get("entries") or []
+            if not slug:
+                continue
+            approved = (slug in after_names) and (slug in declared or slug not in before_names)
+            if not approved:
+                results.append({"slug": slug, "key": key, "target": target,
+                                "status": "kept (skill not materialized/declared)", "link_written": 0,
+                                "removed": [], "kept": list(entries), "chars_before": 0, "chars_after": 0,
+                                "budget_dropped": 0})
+                continue
+            try:
+                if not snap_taken:
+                    snap_taken = True
+                    _snap = _memory_snapshot()
+                    snap_path = _snap["path"] if _snap else None
+                if store is None:
+                    from tools import memory_tool
+                    store = memory_tool.load_on_disk_store()
+                rep = memory_uplift.demote(cand, slug, store)
+                rep["status"] = "demoted"
+                if snap_path:
+                    rep["memory_snapshot"] = snap_path
+                results.append(rep)
+            except Exception as e:
+                logger.debug("Uplift demotion failed for %s: %s", slug, e)
+                results.append({"slug": slug, "key": key, "target": target,
+                                "status": f"kept (error {e})", "link_written": 0, "removed": [],
+                                "kept": list(entries), "chars_before": 0, "chars_after": 0,
+                                "budget_dropped": 0})
+        return results
+    except Exception as e:
+        logger.debug("Curator uplift demotion pass failed: %s", e, exc_info=True)
+        return []
+
+
 def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_names: Set[str]) -> tuple:
-    """The LLM half of a run: fork (unless no candidates), then append the rename map (`old-name → umbrella`) so users
-    needn't dig into REPORT.md. Returns ``(final_summary, llm_meta)``; never raises."""
+    """The LLM half of a run: fork (unless no candidates), the rename map, and the deterministic
+    memory→skill demotion. Returns ``(final_summary, llm_meta, uplift_results)``; never raises.
+    ``uplift_results`` is ``[]`` when the uplift pass did not run (dry-run, off, or no candidates)."""
+    uplift_candidates, jev = ([], {"ok": False}) if dry_run else _uplift_candidates()
+    uplift_results: List[Dict[str, Any]] = []
     try:
         candidate_list = _render_candidate_list()
-        if "No agent-created skills" in candidate_list:
+        no_skill_candidates = "No agent-created skills" in candidate_list
+        if no_skill_candidates and not uplift_candidates:
             final_summary = f"{prefix}{auto_summary}; llm: skipped (no candidates)"
             llm_meta = _llm_meta("skipped (no candidates)")
-        else:
-            # Bundled built-ins are not in the candidate list, even under
-            # prune_builtins: archival is the deterministic pass's job, and
-            # the bundled policy is archive-only. Hard rule #1 therefore
-            # stands unqualified.
-            prompt = f"{CURATOR_REVIEW_PROMPT}\n\n{candidate_list}"
-            if dry_run:
-                prompt = f"{CURATOR_DRY_RUN_BANNER}\n\n{prompt}"
-            llm_meta = _run_llm_review(prompt)
-            final_summary = f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
+            return final_summary, llm_meta, uplift_results
+        # Bundled built-ins are not in the candidate list, even under
+        # prune_builtins: archival is the deterministic pass's job, and
+        # the bundled policy is archive-only. Hard rule #1 therefore
+        # stands unqualified.
+        prompt = f"{CURATOR_REVIEW_PROMPT}\n\n{candidate_list}"
+        uplift_section = _uplift_prompt_section(uplift_candidates, jev)
+        if uplift_section:
+            prompt += "\n\n" + uplift_section
+        if dry_run:
+            prompt = f"{CURATOR_DRY_RUN_BANNER}\n\n{prompt}"
+        llm_meta = _run_llm_review(prompt)
+        final_summary = f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
     except Exception as e:
         logger.debug("Curator LLM pass failed: %s", e, exc_info=True)
         final_summary = f"{prefix}{auto_summary}; llm: error ({e})"
         llm_meta = _llm_meta(f"error ({e})", str(e))
+    # Post-fork, deterministic demotion. Never in dry-run: the fork is told not to mutate, so
+    # nothing is materialised and there is nothing to fold anyway.
+    if uplift_candidates and not dry_run:
+        uplift_results = _demote_validated_uplifts(uplift_candidates, before_names, llm_meta)
     try:  # best-effort: never block the run on formatting
         rename_lines = _build_rename_summary(
             before_names=before_names, after_report=skill_usage.curated_report(),
@@ -908,7 +1096,7 @@ def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_na
             final_summary = f"{final_summary}\n{rename_lines}"
     except Exception as e:
         logger.debug("Curator rename summary build failed: %s", e, exc_info=True)
-    return final_summary, llm_meta
+    return final_summary, llm_meta, uplift_results
 
 
 def run_curator_review(
@@ -960,18 +1148,20 @@ def run_curator_review(
         before_report = _safe_curated_report()
         before_names = set(_by_name(before_report))
         if consolidate:
-            final_summary, llm_meta = _consolidation_pass(prefix, auto_summary, dry_run, before_names)
+            final_summary, llm_meta, uplift_results = _consolidation_pass(prefix, auto_summary, dry_run, before_names)
         else:
             # Prune-only run: record it and write a report, but never fork.
             final_summary = f"{prefix}{auto_summary}; llm: skipped (consolidation off)"
             llm_meta = _llm_meta("skipped (consolidation off)")
+            uplift_results = []
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         state2 = {**load_state(), "last_run_duration_seconds": elapsed, "last_run_summary": final_summary}
         # Per-run report, best-effort; path recorded for `hermes curator status`.
         try:
             report_path = _write_run_report(
                 started_at=start, elapsed_seconds=elapsed, auto_counts=counts, auto_summary=auto_summary,
-                before_report=before_report, before_names=before_names, after_report=_safe_curated_report(), llm_meta=llm_meta,
+                before_report=before_report, before_names=before_names, after_report=_safe_curated_report(),
+                llm_meta=llm_meta, uplifts=uplift_results,
             )
             if report_path is not None:
                 state2["last_report_path"] = str(report_path)
