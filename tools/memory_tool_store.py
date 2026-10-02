@@ -80,6 +80,21 @@ def _stale_entry_message(entry: str) -> str:
             f"pending record has been preserved.")
 
 
+def _notify_patterns(target: str, before: List[str], current: List[str]) -> None:
+    """Fire-and-forget task-pattern capture (E3) for newly added/changed entries.
+
+    Advisory side channel: the feature is opt-in (``memory.task_patterns.enabled``)
+    and any failure must stay out of the memory write path. The capture worker
+    only writes the sidecar ledger (``memories/.memory_patterns.json``), never
+    ``MEMORY.md`` / ``USER.md``.
+    """
+    try:
+        from tools import memory_patterns
+        memory_patterns.maybe_schedule_capture(target, before, current)
+    except Exception:
+        logger.debug("memory patterns: scheduling failed", exc_info=True)
+
+
 # Optional third value of an _apply closure: a dict merged into the success payload —
 # e.g. the full text an entry-level replace overwrote, so a whole-entry write is never
 # silent about the loss (#117952). Same convention as _error(**extra).
@@ -260,6 +275,7 @@ class MemoryStore:
                 return _read_failed_error(path)
             bak = None if skip_drift else self._detect_external_drift(target, raw)
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
+            before_entries = list(self._entries_for(target))
             if bak:
                 return _drift_error(path, bak)
             result = mutate(self._entries_for(target), self._char_limit(target))
@@ -270,6 +286,7 @@ class MemoryStore:
 
             mkdir_under_hermes_home(path.parent)
             self._write_file(path, result[0])
+            _notify_patterns(target, before_entries, result[0])
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 
