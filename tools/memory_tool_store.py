@@ -46,6 +46,24 @@ def _drift_error(path: Path, bak_path: str) -> Dict[str, Any]:
         "memory(action=add, content=...), then remove or rewrite the original file to a clean state."))
 
 
+def _retract_provenance(target: str, removed_entries: List[str]) -> None:
+    """stale-on-retract hook for the provenance ledger (tools/provenance_ledger.py):
+    entries a memory write removed (or replaced away) may have informed a skill or a
+    profile field — mark their backlinks revoked + stale. Fail-open: the memory write is
+    already persisted at the call site, so a ledger error only logs; the write never
+    fails because of the ledger."""
+    if not removed_entries:
+        return
+    try:
+        from tools.provenance_ledger import retract_entries
+        stale_targets = retract_entries(removed_entries, source_type=target)
+        if stale_targets:
+            logger.info("Provenance: memory retraction flagged %d target(s) stale: %s",
+                        len(stale_targets), ", ".join(stale_targets))
+    except Exception:
+        logger.warning("Provenance retraction skipped (memory write unaffected)", exc_info=True)
+
+
 def _read_failed_error(path: Path) -> Dict[str, Any]:
     """Existing-but-unreadable file: saving from an assumed-empty view would wipe it."""
     return _error(
@@ -262,7 +280,8 @@ class MemoryStore:
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
             if bak:
                 return _drift_error(path, bak)
-            result = mutate(self._entries_for(target), self._char_limit(target))
+            before = self._entries_for(target)
+            result = mutate(before, self._char_limit(target))
             if isinstance(result, dict):
                 return result
             self._set_entries(target, result[0])
@@ -270,6 +289,11 @@ class MemoryStore:
 
             mkdir_under_hermes_home(path.parent)
             self._write_file(path, result[0])
+            # stale-on-retract (E1): fires only AFTER the drift guard passed and the
+            # atomic write landed — a refused (drifted) write returns above, so it
+            # retracts nothing: no retraction is lost or faked while a write is lost
+            # (issue #26045 guard).
+            _retract_provenance(target, [e for e in before if e not in result[0]])
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 

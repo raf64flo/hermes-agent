@@ -1494,6 +1494,17 @@ DEFAULT_CONFIG = {
         "ledger_max_bytes": 5 * 1024 * 1024,
     },
 
+    # Provenance ledger (tools/provenance_ledger.py) — SQLite backlinks from memory /
+    # user-profile / session sources to the skills and profile fields they informed, so a
+    # removed or replaced source entry can flag what it informed (stale-on-retract).
+    # Empty (default) = ledger OFF: the memory-store retraction hook and the E2/E4
+    # recorders no-op. When set: absolute or ~-expanded path; a relative path is ignored
+    # (it would resolve against the process CWD). Telemetry, not a gate — ledger errors
+    # never fail a memory write (fail-open; curator backup model on a corrupt file).
+    "provenance": {
+        "ledger_path": "",
+    },
+
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
     # long-unused skills stale, archives (never deletes) obsolete ones, optionally consolidates
     # overlaps via a forked aux-model agent. Inactivity-triggered from session start, no cron
