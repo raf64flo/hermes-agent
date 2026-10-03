@@ -183,18 +183,18 @@ A skill exists to make the agent's process more predictable — the agent reliab
 - **Supporting files:** `write_file` to `references/`, `templates/`, or `scripts/` under the skill dir.
 - **Always commit** — in-repo skills are source, not runtime state. Re-run the docs generator when frontmatter changed.
 
-## Common Pitfalls
+## What NOT to do (verified)
 
-1. **Using `skill_manage(action='create')` for an in-repo skill.** It writes to `~/.hermes/skills/`, not the repo tree. Use `write_file`.
-2. **Trusting the validator's limits as the standard.** The validator allows 1024-char descriptions; review rejects anything over 60. The validator doesn't check `platforms:`, author format, tests, or docs — review does.
-3. **`author: Hermes Agent` on a contributed skill.** Credit the human first.
-4. **Leading whitespace before `---`.** Validation fails on any leading blank line or BOM.
-5. **Description too generic or trigger buried past char 57.**
-6. **`related_skills` pointing at skills that don't exist in-repo** (user-local, planned, or in a sibling PR).
-7. **Duplicating a peer.** Survey the category first; extend rather than sibling.
-8. **Skipping the docs generator or pushing its unrelated drift.** Both directions are wrong: no regen = orphan skill with no docs page; blind regen = a ballooned diff full of other skills' drift.
-9. **Expecting the current session to see the new skill.** The loader is initialized at session start.
-10. **Letting skills accumulate sediment.** When adding a rule, remove the old wording it replaces.
+- **Don't create an in-repo skill with `skill_manage(action='create')`** — it writes to `~/.hermes/skills/`, not the repo tree; use `write_file` + `git add`.
+- **Don't take the validator's limits for the standard.** A 1024-char description passes the validator and fails review; the validator doesn't check `platforms:`, author format, tests, or docs — review does.
+- **Don't credit `author: Hermes Agent` alone** on a contributed skill; the human contributor comes first.
+- **Don't leave leading whitespace or a BOM before `---`** — validation fails on any leading blank line.
+- **Don't bury the trigger past char 57** with a too-generic description; the system prompt truncates there.
+- **Don't point `related_skills` at skills that don't exist in-repo** (user-local, planned, or sibling-PR); every entry must resolve in the same tree state as your PR.
+- **Don't duplicate a peer.** Survey the category first; extend rather than create a narrow sibling.
+- **Don't skip docs regeneration, and don't blind-regenerate either.** No regen = orphan skill; blind regen = a ballooned diff full of other skills' drift. Regen, then `git checkout --` everything that isn't yours.
+- **Don't expect the current session to see the new skill** — the loader is initialized at session start; reload in a new session.
+- **Don't let skills accumulate sediment.** When a rule lands, remove the old wording it replaces.
 
 ## Verification Checklist
 
