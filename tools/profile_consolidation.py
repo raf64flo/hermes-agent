@@ -223,13 +223,14 @@ class ProfileConsolidator:
         remaining = cooldown_secs - elapsed
         return False, f"cooldown active: {remaining:.0f}s remaining"
 
-    def _gate_errors(self) -> Optional[Dict[str, Any]]:
-        """Return an error dict if the hard gates block an edit, else None."""
-        if not self.cfg.get("enabled", False):
-            return {"success": False, "error": (
-                "Profile consolidation is disabled (memory.profile_consolidation.enabled=false). "
-                "Enable it in config.yaml to use this tool.")}
-        # Hard gate: user_profile must be enabled in the memory store
+    def _user_profile_gate(self) -> Optional[Dict[str, Any]]:
+        """Return an error dict if the hard ``user_profile_enabled`` consent gate
+        blocks a write to USER.md, else None.
+
+        This is the spec's hard write gate — it holds for EVERY write, including the
+        ``mark_stale`` fast path and ``rollback`` (which bypass the cooldown and the
+        candidate threshold, but never the user's consent to profile writes).
+        """
         try:
             from tools.memory_tool import get_builtin_memory_store_flags
             _, user_on = get_builtin_memory_store_flags()
@@ -240,6 +241,14 @@ class ProfileConsolidator:
         except Exception:
             pass  # config load failed — don't block on a soft error
         return None
+
+    def _gate_errors(self) -> Optional[Dict[str, Any]]:
+        """Return an error dict if the hard gates block an edit, else None."""
+        if not self.cfg.get("enabled", False):
+            return {"success": False, "error": (
+                "Profile consolidation is disabled (memory.profile_consolidation.enabled=false). "
+                "Enable it in config.yaml to use this tool.")}
+        return self._user_profile_gate()
 
     # ── actions ─────────────────────────────────────────────────────────────
 
@@ -374,12 +383,17 @@ class ProfileConsolidator:
     def mark_stale(self, target_id: str = PROFILE_TARGET_ID) -> Dict[str, Any]:
         """Mark stale bullets in USER.md for revoked provenance rows.
 
-        Bypasses cooldown and min_candidates threshold (fast path).
+        Bypasses the cooldown and the min_candidates threshold (fast path), but NOT
+        the hard ``user_profile_enabled`` consent gate: when profile writes are
+        disabled, this refuses instead of modifying USER.md.
         Appends [STALE] to the matching bullet — never deletes.
         One pass, idempotent.
         """
-        # No gate: mark_stale is a fast path that works even when consolidation is disabled.
-        # (The provenance ledger must be on for this to do anything useful.)
+        # Fast path: no consolidation ``enabled`` gate, no cooldown/threshold. But the
+        # hard user_profile_enabled consent gate still applies (spec: hard write gate).
+        gate = self._user_profile_gate()
+        if gate:
+            return gate
         from tools.provenance_ledger import rows_for_target, ledger_path
         if ledger_path() is None:
             return {"success": True, "marked": 0, "reason": "provenance ledger not configured"}
@@ -420,7 +434,15 @@ class ProfileConsolidator:
 
         Before restoring: archive the current state (so a failed rollback can be undone).
         Returns the archive filename that was restored.
+
+        No consolidation ``enabled`` gate (rollback is a safety net that must work even
+        if consolidation is later disabled), but the hard ``user_profile_enabled``
+        consent gate holds — rollback writes to USER.md, so it refuses when profile
+        writes are disabled.
         """
+        gate = self._user_profile_gate()
+        if gate:
+            return gate
         if not self.archives_dir.exists():
             return {"success": False, "error": "No archives directory found."}
         archives = sorted(self.archives_dir.glob("USER.md.*.md"))

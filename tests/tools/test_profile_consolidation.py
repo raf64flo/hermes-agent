@@ -30,8 +30,10 @@ def _iso_offset(now: float, hours: float) -> str:
         "%Y-%m-%dT%H:%M:%SZ")
 
 
-def _stub_config(monkeypatch, ledger_path, pc_overrides=None):
-    """Stub the config loaders: one memory section (profile writes on) + one provenance."""
+def _stub_config(monkeypatch, ledger_path, pc_overrides=None, memory_overrides=None):
+    """Stub the config loaders: one memory section (profile writes on by default)
+    + one provenance section. ``memory_overrides`` can e.g. force
+    ``user_profile_enabled: False`` to exercise the hard consent gate."""
     import hermes_cli.config as _cfg
 
     pc = {
@@ -40,7 +42,10 @@ def _stub_config(monkeypatch, ledger_path, pc_overrides=None):
     }
     if pc_overrides:
         pc.update(pc_overrides)
-    cfg = {"memory": {"profile_consolidation": pc},
+    memory = {"profile_consolidation": pc}
+    if memory_overrides:
+        memory.update(memory_overrides)
+    cfg = {"memory": memory,
            "provenance": {"ledger_path": ledger_path}}
     monkeypatch.setattr(_cfg, "load_config", lambda *a, **k: cfg)
     monkeypatch.setattr(_cfg, "load_config_readonly", lambda *a, **k: cfg)
@@ -271,3 +276,55 @@ class TestAc3:
         res = tc.rollback()
         assert res["success"] is False
         assert "No archives" in res["error"]
+
+
+# ── hard gate: user_profile_enabled (spec §Consent, hard write gate) ────────
+# The user_profile_enabled gate holds for EVERY write to USER.md — consolidate,
+# mark_stale and rollback alike. It is independent of the consolidation
+# opt-in flag and of the cooldown/threshold bypasses.
+class TestUserProfileGate:
+    def test_mark_stale_refused_when_profile_writes_disabled(self, env, monkeypatch):
+        """AC2 fix: mark_stale bypasses cooldown/threshold, but NOT the consent gate.
+
+        When memory.user_profile_enabled=false, mark_stale must refuse even when
+        the consolidation opt-in is ON and a provenance row is revoked+stale.
+        """
+        from tools.provenance_ledger import record, retract, entry_source_id
+        _stub_config(monkeypatch, str(env["db"]), memory_overrides={"user_profile_enabled": False})
+        from tools.profile_consolidation import ProfileConsolidator, load_profile_consolidation_config
+        tc = ProfileConsolidator(env["user_md"], env["state_dir"],
+                                 load_profile_consolidation_config())
+        bullet = "Benchmarks sequential, never parallel (RTX 3500 12GB)"
+        _write_user_md(env["user_md"], _bullets(bullet, "another fact"))
+
+        # a revoked+stale provenance row exists — the fast path WOULD fire...
+        src = entry_source_id(bullet)
+        assert record(src, "memory", "user_profile", "INFORMED_BY", source_text=bullet) is not None
+        assert "user_profile" in retract(src, "memory")
+        # ...and the cooldown is even active.
+
+        res = tc.mark_stale()
+        assert res["success"] is False
+        assert "user_profile_enabled" in res["error"]
+        # USER.md untouched, no [STALE] marker, no archive created
+        assert env["user_md"].read_text(encoding="utf-8") == _bullets(bullet, "another fact")
+        assert "[STALE]" not in env["user_md"].read_text(encoding="utf-8")
+        assert not (env["state_dir"] / "archives").exists()
+
+    def test_rollback_refused_when_profile_writes_disabled(self, env, monkeypatch):
+        """AC3 fix: rollback is a safety net (no consolidation gate) but a write
+        nonetheless — it must refuse when profile writes are disabled."""
+        _stub_config(monkeypatch, str(env["db"]), memory_overrides={"user_profile_enabled": False})
+        from tools.profile_consolidation import ProfileConsolidator, load_profile_consolidation_config
+        tc = ProfileConsolidator(env["user_md"], env["state_dir"],
+                                 load_profile_consolidation_config())
+        old = _bullets("the original profile")
+        _write_user_md(env["user_md"], old)
+        # an archive exists so the only thing that can block is the gate
+        env["tc"]._archive_current()
+
+        res = tc.rollback()
+        assert res["success"] is False
+        assert "user_profile_enabled" in res["error"]
+        # USER.md untouched
+        assert env["user_md"].read_text(encoding="utf-8") == old
