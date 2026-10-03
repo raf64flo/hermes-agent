@@ -910,6 +910,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._matrix_session_scope = raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
         self._process_notices: bool = self._extra_truthy(config, "process_notices", "MATRIX_PROCESS_NOTICES", "false")
         self._reactions_enabled: bool = str(_extra_or_secret(config.extra, "reactions", "MATRIX_REACTIONS", "true")).lower() not in {"false", "0", "no"}
+        # Forward non-approval reactions to the agent session (PR #43745).
+        self._forward_reactions: bool = config.extra.get("forward_reactions", True)
         self._pending_reactions: dict[tuple[str, str], str] = {}
         # Let the final message land before redacting reactions ("missing event" in some
         # clients). 5s is empirically safe; if it must be tunable, use config.yaml not env.
@@ -2521,6 +2523,15 @@ class MatrixAdapter(BasePlatformAdapter):
             if await handler(room_id, reacts_to, key, sender):
                 return
 
+        # Non-approval / non-picker reaction — forward to the agent session
+        # so the model can perceive user reactions (👍, ❤️, etc.). This is
+        # the inbound half of PR #43745; reactions that resolved an
+        # approval/model/choice prompt above already returned.
+        if self._forward_reactions:
+            await self._forward_reaction_to_agent(
+                room_id, sender, event_id, reacts_to, key,
+            )
+
     async def _claim_reaction_prompt(
         self, registry: dict, room_id: str, reacts_to: str, key: str, sender: str, label: str, invalid_text: str,
         on_expired, choices: Optional[dict] = None) -> tuple[bool, Any, Any]:
@@ -2604,6 +2615,83 @@ class MatrixAdapter(BasePlatformAdapter):
             await self.send(room_id, t("platform.matrix.picker.failed", action=t(verbs[1]), error=str(exc)),
                             reply_to=reacts_to)
         return True
+
+    async def _forward_reaction_to_agent(
+        self,
+        room_id: str,
+        sender: str,
+        event_id: str,
+        reacts_to: str,
+        key: str,
+    ) -> None:
+        """Forward a non-approval reaction into the agent session."""
+        try:
+            # Resolve context (DM detection, thread, display name, source).
+            # Reactions bypass mention gating — they are intentional user
+            # interactions, not ambient room chatter.
+            is_dm = await self._is_dm_room(room_id)
+            chat_type = "dm" if is_dm else "group"
+            display_name = await self._get_display_name(room_id, sender)
+            source = self.build_source(
+                chat_id=room_id,
+                chat_type=chat_type,
+                user_id=sender,
+                user_name=display_name,
+            )
+            # Check room allowlist for group chats.
+            if not is_dm and self._allowed_rooms and room_id not in self._allowed_rooms:
+                return
+            body = f"[reaction] reacted with {key} to the message above."
+            self._deposit_veille_reaction(room_id, sender, key, reacts_to)
+            msg_event = MessageEvent(
+                text=body,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={"reaction": key, "reacts_to": reacts_to},
+                message_id=event_id,
+                reply_to_message_id=reacts_to,
+            )
+            await self.handle_message(msg_event)
+        except Exception as exc:
+            logger.error("Failed to forward Matrix reaction to agent: %s", exc)
+
+    def _deposit_veille_reaction(
+        self,
+        room_id: str,
+        sender: str,
+        emoji: str,
+        target_event_id: str,
+    ) -> None:
+        """Dépôt local (non-bloquant) d'une réaction → ``data/reactions.jsonl``.
+
+        Contrepartie de dépôt de ``veille.tchap.read_reactions`` (SPEC §13.2).
+        Ne duplique PAS le forward amont #43745 : on réutilise les champs déjà
+        déchiffrés ici (seule l'adapter voit le contenu Megolm déchiffré sur
+        Tchap E2EE — un poller via l'API brute ne le verrait pas). Le dépôt est
+        délégué à ``veille.reactions.capture_forwarded_reaction`` (idempotent),
+        importé depuis le dépôt veille via ``VEILLE_REPO``. Toute erreur est
+        loggée en warning et n'interrompt jamais le forward de la réaction.
+        """
+        try:
+            import os
+            import sys
+
+            repo = os.getenv("VEILLE_REPO", "/home/rflores/local/git/veille")
+            if repo and repo not in sys.path:
+                sys.path.insert(0, repo)
+            from veille.reactions import capture_forwarded_reaction
+
+            capture_forwarded_reaction(
+                sender=sender,
+                emoji=emoji,
+                target_event_id=target_event_id,
+                room_id=room_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — dépôt best-effort
+            logger.warning(
+                "veille: dépôt de la réaction %s sur %s impossible : %s",
+                emoji, target_event_id, exc,
+            )
 
     def _matrix_prompt_expired(self, prompt: Any) -> bool:
         expires_at = getattr(prompt, "expires_at", None)
