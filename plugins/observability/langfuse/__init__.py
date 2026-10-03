@@ -239,6 +239,16 @@ def _get_langfuse() -> Optional[Langfuse]:
     return None if settled is _INIT_FAILED else settled
 
 
+def _default_environment() -> str:
+    """Resolve the profile in the current execution scope, without exporting paths."""
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home
+
+        return profile_name_for_home(get_hermes_home()) or ""
+    except Exception:  # fail-open: profile lookup must not disable tracing
+        return ""
+
+
 def _build_client() -> Optional[Langfuse]:
     """Construct the SDK client from env, or None (with one warning) when it can't be."""
     if Langfuse is None:
@@ -273,6 +283,8 @@ def _build_client() -> Optional[Langfuse]:
     for key, name, default in (("base_url", "BASE_URL", "https://cloud.langfuse.com"), ("environment", "ENV", ""),
                                ("release", "RELEASE", "")):
         value = _secret(f"HERMES_LANGFUSE_{name}") or _secret(f"LANGFUSE_{name}") or default
+        if key == "environment" and not value:
+            value = _default_environment()
         if value:
             kwargs[key] = value
     sample_rate = _secret("HERMES_LANGFUSE_SAMPLE_RATE")
