@@ -23,6 +23,7 @@ _HERMES_CORE_TOOLS = [
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
     "todo_list", "memory",
+    "profile_consolidation",
     "session_search",
     "clarify",
     "execute_code", "delegate_task",

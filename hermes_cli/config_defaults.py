@@ -1325,6 +1325,20 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
+        # Bounded one-pass profile consolidation (tools/profile_consolidation.py) — the model
+        # EDITS USER.md as a whole (never appends): backlog ≥ min_candidates facts, wait the
+        # cooldown, then one bounded rewrite (≤ char_limit, ≤ max_bullets). Before each edit the
+        # current state is archived under memories/.profile/archives/ (rollback possible).
+        # mark_stale is a fast path (no cooldown/threshold): a retracted source (E1 provenance)
+        # gets a [STALE] marker on the bullet it informed — never deleted on the fly.
+        # OFF by default; opt-in per profile. user_profile_enabled stays the hard write gate.
+        "profile_consolidation": {
+            "enabled": False,
+            "min_candidates": 5,      # facts pending in the backlog before an edit is due
+            "cooldown_hours": 24,     # wait between two consolidations
+            "max_bullets": 12,        # §-delimited bullet ceiling for the rewritten profile
+            "char_limit": 1500,       # whole-file char ceiling (~550 tokens at 2.75 chars/token)
+        },
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
