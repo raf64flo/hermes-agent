@@ -126,6 +126,41 @@ class TestEligiblePatterns:
         assert mu.eligible_patterns(None) == []  # load_ledger() on an empty home → empty
 
 
+class TestEvictionSansMotifNonCandidate:
+    """AC fail-closed (audit OMH 2026-10-02 reco 2b) : une entrée sans motif n'est
+    PAS candidate à la promotion/démotion — décidé déterministiquement à la
+    sélection des candidats, AVANT tout jugement modèle. Pas de motif = pas de
+    candidat, jamais « le modèle décide dans le doute ». Sans LLM."""
+
+    def test_groupe_sans_motif_non_candidate(self):
+        # k-x et k-y portent ≥2 entrées (déclencheur) mais AUCUN label de motif →
+        # exclus ; seul k-ok, qui a un vrai motif, est candidat.
+        ledger = {
+            "version": 1,
+            "patterns": [
+                {"key": "k-x", "label": "", "canonical": "X", "entries": ["E1", "E2"]},
+                {"key": "k-y", "canonical": "Y", "entries": ["E3", "E4"]},  # pas de clé label
+                {"key": "k-ok", "label": "Vraie procédure", "canonical": "Z",
+                 "entries": ["E5", "E6"]},
+            ],
+            "folded": [], "decisions": [],
+        }
+        out = mu.eligible_patterns(ledger)
+        assert [c["key"] for c in out] == ["k-ok"]
+        # Tout candidat porte un vrai motif (déterministe, sans modèle).
+        assert all(c.get("label") for c in out)
+
+    def test_entrees_sans_motif_jamais_emises(self):
+        # Des entrées sans motif (hors de tout groupe étiqueté) ne remontent jamais
+        # comme candidat : la sélection ne part que des groupes du ledger.
+        assert mu.eligible_patterns({"version": 1, "patterns": [], "folded": [], "decisions": []}) == []
+        # Un groupe sans aucune clé label est droppé par le garde fail-closed.
+        out = mu.eligible_patterns(
+            {"version": 1, "patterns": [{"entries": ["E1", "E2"]}],
+             "folded": [], "decisions": []})
+        assert out == []
+
+
 # ---------------------------------------------------------------------------
 # render_uplift_section — the prompt the fork sees (AC1 input)
 # ---------------------------------------------------------------------------

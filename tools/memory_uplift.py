@@ -100,6 +100,13 @@ def eligible_patterns(ledger: Optional[Dict[str, Any]] = None,
         if len(entries) < min_entries:
             continue
         label = str(p.get("label") or "").strip()
+        # Garde fail-closed (AC E2, audit OMH 2026-10-02 reco 2b) : une entrée sans
+        # motif n'est PAS candidate à la promotion/démotion — pas de label = pas de
+        # motif = pas de candidat, vérifié ICI à la sélection, AVANT tout jugement
+        # modèle. Jamais « le modèle décide dans le doute ». Nommée
+        # `unexplained_entries_are_not_candidates` pour traçabilité.
+        if not label:
+            continue  # unexplained_entries_are_not_candidates
         slug = derive_slug(label)
         if not slug:
             continue
