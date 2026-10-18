@@ -27,7 +27,7 @@ import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '
 import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
 import { pushSnapshot } from './spawnHistoryStore.js'
-import { createStreamTpsCounter } from './streamTps.js'
+import { createStreamTpsCounter, WINDOW_MS } from './streamTps.js'
 import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
@@ -192,6 +192,7 @@ class TurnController {
   private reasoningStreamingTimer: Timer = null
   private reasoningTimer: Timer = null
   private streamTimer: Timer = null
+  private liveTpsDecayTimer: Timer = null
   private streamDelay = STREAM_IDLE_BATCH_MS
   // Live t/s over streamed deltas; the server's usage.avg_tps only updates when
   // an API call completes, so this fills the gap while tokens are arriving.
@@ -357,6 +358,7 @@ class TurnController {
       tools: [],
       turnTrail: []
     })
+    this.liveTpsDecayTimer = clear(this.liveTpsDecayTimer)
     patchUiState({ busy: false, compacting: false, liveTps: null })
     resetFlowOverlays()
   }
@@ -791,6 +793,16 @@ class TurnController {
   private sampleLiveTps(now: number = Date.now()) {
     const liveTps = this.streamTps.accumulate(now)
 
+    // A turn goes quiet for seconds at a time (tool call, end of the reasoning
+    // phase). Without a decay the bar keeps the last instantaneous rate on
+    // screen, which reads as a frozen counter, so fall back to the server
+    // average once a full window has passed without a delta.
+    this.liveTpsDecayTimer = clear(this.liveTpsDecayTimer)
+    this.liveTpsDecayTimer = setTimeout(() => {
+      this.liveTpsDecayTimer = null
+      patchUiState({ liveTps: null })
+    }, WINDOW_MS + 200)
+
     if (liveTps !== undefined) {
       patchUiState({ liveTps })
     }
@@ -1063,6 +1075,7 @@ class TurnController {
 
   startMessage() {
     this.streamTps.reset()
+    this.liveTpsDecayTimer = clear(this.liveTpsDecayTimer)
     patchUiState({ liveTps: null })
     this.endReasoningPhase()
     this.clearReasoning()

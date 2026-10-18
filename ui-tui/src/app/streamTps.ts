@@ -18,7 +18,7 @@
  * tests do not need fake timers.
  */
 
-const WINDOW_MS = 2000
+export const WINDOW_MS = 2000
 const THROTTLE_MS = 1000
 const MIN_SAMPLES = 3
 

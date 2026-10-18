@@ -52,6 +52,18 @@ describe('turnController live t/s sampling', () => {
     expect(getUiState().liveTps).toBe(20)
   })
 
+  it('drops back to the server average when the stream goes quiet', () => {
+    turnController.startMessage()
+    feedReasoning(20, 50)
+    expect(getUiState().liveTps).toBe(10)
+
+    // Tool calls and the gap before a content stream can last seconds; a frozen
+    // instantaneous rate is worse than no rate at all.
+    vi.advanceTimersByTime(2300)
+
+    expect(getUiState().liveTps).toBeNull()
+  })
+
   it('clears the live rate when the turn starts over', () => {
     turnController.startMessage()
     feedReasoning(20, 50)
