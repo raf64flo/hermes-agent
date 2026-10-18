@@ -2091,6 +2091,7 @@ def test_cross_board_ref_classified_not_phantom(kanban_home):
     legitimate cross-board reference — it must NOT be flagged as a
     hallucinated/phantom id, and must surface under a distinct event.
     """
+    kb.create_board("mattermost-rgpd")
     with kbc.connect(board="mattermost-rgpd") as xconn:
         cross_tid = kb.create_task(xconn, title="cross board task", assignee="alice")
 
@@ -2132,6 +2133,7 @@ def test_cross_board_ref_still_phantom_when_nowhere(kanban_home):
 
 def test_cross_board_ref_unit_classifier(kanban_home):
     """The classifier splits a mixed bag correctly and dedupes."""
+    kb.create_board("mattermost-rgpd")
     with kbc.connect(board="mattermost-rgpd") as xconn:
         cross_tid = kb.create_task(xconn, title="x", assignee="alice")
     with kbc.connect() as conn:
