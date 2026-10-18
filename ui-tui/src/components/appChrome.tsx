@@ -550,6 +550,7 @@ export function StatusRule({
   bgCount,
   lastTurnEndedAt,
   liveSessionCount,
+  liveTps = null,
   sessionTitle,
   sessionStartedAt,
   turnStartedAt,
@@ -676,7 +677,10 @@ export function StatusRule({
   const showCacheHit = segs.cacheHit && ok('cache_hit') && !!cacheHitText && fits(SEP + stringWidth(cacheHitText))
   const latencyText = typeof usage.avg_latency_s === 'number' ? `◷ ${usage.avg_latency_s.toFixed(1)}s` : ''
   const showLatency = segs.latency && ok('latency') && !!latencyText && fits(SEP + stringWidth(latencyText))
-  const tpsText = typeof usage.avg_tps === 'number' ? `↑ ${Math.round(usage.avg_tps)} t/s` : ''
+  // Prefer live streaming throughput while a turn runs: it moves with every
+  // delta. Fall back to the server's per-call rolling average when idle.
+  const tpsValue = busy && typeof liveTps === 'number' ? liveTps : usage.avg_tps
+  const tpsText = typeof tpsValue === 'number' ? `↓ ${Math.round(tpsValue)} t/s` : ''
   const showTps = segs.tps && ok('tps') && !!tpsText && fits(SEP + stringWidth(tpsText))
 
   const showVoice = segs.voice && ok('voice') && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
@@ -992,6 +996,8 @@ interface StatusRuleProps {
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number
+  // Client-side instantaneous t/s while streaming; null when idle.
+  liveTps?: null | number
   busy: boolean
   // Context compaction in progress — FaceTicker freezes on "compacting".
   compacting?: boolean
