@@ -457,6 +457,17 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     expect(textContent(element)).toContain('↓ 50 t/s')
   })
 
+  it('shows session token totals as input-up output-down', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 160,
+      usage: { ...perfUsage, input: 12_300, output: 4_500 }
+    })
+    const rendered = textContent(element)
+
+    expect(rendered).toContain('↑ 12k ↓ 4.5k')
+  })
+
   it('self-hides when the server omits the keys', () => {
     const element = StatusRule({ ...baseProps, cols: 160 })
     const rendered = textContent(element)
