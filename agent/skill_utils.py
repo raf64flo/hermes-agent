@@ -2,12 +2,14 @@
 Import-light by design: no tool registry, CLI config, or provider resolution."""
 
 import ast
+import fnmatch
 import hashlib
 import logging
 import os
 import re
 import sys
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -317,9 +319,9 @@ def _normalize_string_set(values) -> set[str]:
     return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
-# config identity -> resolved external dirs. Called once per skill during
-# banner / tool-registry scans; re-resolving each time dominated cold-start.
-_EXTERNAL_DIRS_CACHE: dict[tuple[str, int, int, int, int], list[Path]] = {}
+# config identity (+ entry-filter signature) -> resolved external dirs. Called once per
+# skill during banner / tool-registry scans; re-resolving each time dominated cold-start.
+_EXTERNAL_DIRS_CACHE: dict[tuple[Any, ...], list["ExternalDirEntry"]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -337,34 +339,101 @@ def _config_str_list(raw) -> list[str]:
     return [e for e in (str(entry).strip() for entry in raw) if e]
 
 
-def get_external_skills_dirs() -> list[Path]:
-    """Validated, deduplicated ``skills.external_dirs`` (existing dirs only). Entries
-    are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped."""
+@dataclass
+class ExternalDirEntry:
+    """One ``skills.external_dirs`` entry: a resolved dir plus its per-entry glob filters.
+    ``include`` admits only the declared skill names it matches, ``exclude`` always wins over it."""
+    path: Path
+    include: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
+
+
+def _entry_glob_patterns(entry: dict[str, Any], key: str) -> list[str]:
+    """``include``/``exclude`` globs of one dict entry; blank globs are dropped (debug-logged)."""
+    raw = entry.get(key)
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        logger.debug("Ignoring non-list %r in skills.external_dirs entry %r", key, entry)
+        return []
+    patterns = []
+    for pattern in (p.strip() for p in parse_config_string_list(raw)):
+        if pattern:
+            patterns.append(pattern)
+        else:
+            logger.debug("Ignoring empty %r glob in skills.external_dirs entry %r", key, entry)
+    return patterns
+
+
+def _parse_external_dirs(raw: Any) -> list[tuple[str, list[str], list[str]]]:
+    """``(path, include, exclude)`` triples from ``skills.external_dirs``. Both accepted forms:
+    a bare path string (legacy — every skill of the dir stays visible) or a dict carrying
+    ``path`` plus optional ``include``/``exclude`` glob lists."""
+    if isinstance(raw, (str, os.PathLike)):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    parsed: list[tuple[str, list[str], list[str]]] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            path = entry.get("path")
+            if not isinstance(path, (str, os.PathLike)) or not str(path).strip():
+                logger.debug("Ignoring skills.external_dirs entry without a usable path: %r", entry)
+                continue
+            parsed.append((str(path).strip(),
+                           _entry_glob_patterns(entry, "include"),
+                           _entry_glob_patterns(entry, "exclude")))
+            continue
+        text = str(entry).strip()
+        if text:
+            parsed.append((text, [], []))
+    return parsed
+
+
+def _external_dirs_signature(parsed: list[tuple[str, list[str], list[str]]]) -> str:
+    """Hash of the parsed entries AND their filters: a filter edit must invalidate the cache even
+    when config.yaml's stat version has not moved (same-second rewrite)."""
+    return hashlib.sha256(repr(parsed).encode("utf-8")).hexdigest()
+
+
+def get_external_skills_dir_entries() -> list[ExternalDirEntry]:
+    """Validated, deduplicated ``skills.external_dirs`` entries (existing dirs only), each with its
+    filters. Entries are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is
+    skipped, and the first entry wins when a path is listed twice."""
     from hermes_cli.config_backend import config_exists
     config_path = get_config_path()
     if not config_exists(config_path):
         return []
-    full_key = _config_cache_key(config_path)
-    cache_key = full_key
-    cached = _EXTERNAL_DIRS_CACHE.get(cache_key) if cache_key is not None else None
-    if cached is not None:
-        return list(cached)  # copy so callers can't mutate the cache
     skills_cfg = _skills_cfg()
     if skills_cfg is None:
         return []
+    parsed = _parse_external_dirs(skills_cfg.get("external_dirs"))
+    full_key = _config_cache_key(config_path)
+    cache_key = None if full_key is None else (*full_key, _external_dirs_signature(parsed))
+    cached = _EXTERNAL_DIRS_CACHE.get(cache_key) if cache_key is not None else None
+    if cached is not None:
+        return list(cached)  # copy so callers can't mutate the cache
     local_skills = get_skills_dir().resolve()
-    result: list[Path] = []
-    for entry in _config_str_list(skills_cfg.get("external_dirs")):
+    result: list[ExternalDirEntry] = []
+    seen: set[Path] = set()
+    for entry, include, exclude in parsed:
         p = _home_relative(_expand_path(entry)).resolve()
-        if p == local_skills or p in result:
+        if p == local_skills or p in seen:
             continue
-        if p.is_dir():
-            result.append(p)
-        else:
+        if not p.is_dir():
             logger.debug("External skills dir does not exist, skipping: %s", p)
+            continue
+        seen.add(p)
+        result.append(ExternalDirEntry(path=p, include=include, exclude=exclude))
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
+
+
+def get_external_skills_dirs() -> list[Path]:
+    """Just the directories of :func:`get_external_skills_dir_entries` — the legacy shape kept for
+    every caller that only needs the search roots."""
+    return [entry.path for entry in get_external_skills_dir_entries()]
 
 
 def get_skill_create_dir() -> Optional[Path]:
@@ -470,13 +539,46 @@ def is_disabled_entry(entry: dict[str, Any], disabled: set[str]) -> bool:
     return not disabled.isdisjoint({str(entry["name"]), entry.get("load_name")} - {None})
 
 
+def _external_entry_admits(name: str, entry: ExternalDirEntry) -> bool:
+    """``exclude`` wins over ``include``; an absent or empty ``include`` admits every declared name."""
+    if any(fnmatch.fnmatch(name, pattern) for pattern in entry.exclude):
+        return False
+    return not entry.include or any(fnmatch.fnmatch(name, pattern) for pattern in entry.include)
+
+
+def filter_external_skills_by_entry(entries: list[dict[str, Any]],
+                                    external_dirs: list[ExternalDirEntry]) -> list[dict[str, Any]]:
+    """Drop the ``TIER_EXTERNAL`` catalog entries their own ``skills.external_dirs`` entry hides.
+
+    Filters match the DECLARED name (``entry["name"]``), never the directory name or the relative
+    path, so a skill keeps the identity ``skill_view`` resolves it by. Entries of every other tier,
+    and external entries whose dir carries no filter, pass through untouched; ``skills.disabled`` is
+    applied by the caller afterwards, so it still wins over a matching ``include``."""
+    filters = {Path(e.path): e for e in external_dirs if e.include or e.exclude}
+    if not filters:
+        return entries
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        matched = filters.get(Path(entry["root"])) if entry.get("tier") == TIER_EXTERNAL else None
+        if matched is None or _external_entry_admits(str(entry["name"]), matched):
+            kept.append(entry)
+            continue
+        logger.debug("Skill '%s' at %s hidden by its external dir filters (include=%s, exclude=%s)",
+                     entry["name"], entry["path"], matched.include, matched.exclude)
+    return kept
+
+
 def resolve_skill_catalog(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Copies of scanned skills (each with ``name``, ``tier``, ``root`` and ``path`` = its SKILL.md)
     annotated with what skill_view() resolves, using its aliases (declared name, directory name, path
-    relative to the root) and :func:`pick_skill_candidate`. Adds ``relative_path`` and ``status``:
+    relative to the root) and :func:`pick_skill_candidate`. Entries hidden by their
+    ``skills.external_dirs`` entry filters are dropped first (:func:`filter_external_skills_by_entry`),
+    so a filtered-out copy neither shadows nor makes an ambiguous twin.
+    Adds ``relative_path`` and ``status``:
     ``unique`` (``load_name`` = name), ``ambiguous`` (``load_name`` = the exact relative path, or None
     when even that is shared) or ``shadowed`` (a higher tier owns the name: hidden, warned once)."""
-    out = [dict(e) for e in entries]
+    out = filter_external_skills_by_entry([dict(e) for e in entries],
+                                          get_external_skills_dir_entries())
     owners: dict[str, list[int]] = {}
     for i, e in enumerate(out):
         skill_dir = Path(e["path"]).parent

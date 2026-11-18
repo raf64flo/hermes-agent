@@ -1224,9 +1224,14 @@ skills:
   # and resolved to an absolute path.  External dirs are read-only: skill
   # creation always writes to ~/.hermes/skills/.  Local skills take precedence
   # when names collide.
+  # Each entry is either a path string (all skills visible) or a dict with path
+  # + optional include/exclude filters.  Filters are globs (fnmatch) applied to
+  # the declared skill name.  Priority: skills.disabled > exclude > include.
   # external_dirs:
   #   - ~/.agents/skills
-  #   - /home/shared/team-skills
+  #   - path: /home/shared/team-skills
+  #     include: ["ansible-*", "git-*"]
+  #     exclude: ["ansible-deprecated"]
 
 # =============================================================================
 # Agent Behavior
